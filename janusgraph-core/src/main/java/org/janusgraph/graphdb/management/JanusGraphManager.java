@@ -16,18 +16,26 @@ package org.janusgraph.graphdb.management;
 
 import org.janusgraph.graphdb.database.StandardJanusGraph;
 import org.janusgraph.core.JanusGraphFactory;
+import org.janusgraph.core.ConfiguredGraphFactory;
 
 import org.apache.tinkerpop.gremlin.structure.Graph;
 import org.apache.tinkerpop.gremlin.process.traversal.TraversalSource;
 import org.apache.tinkerpop.gremlin.server.GraphManager;
 import org.apache.tinkerpop.gremlin.server.Settings;
+import org.apache.tinkerpop.gremlin.groovy.engine.GremlinExecutor;
 import org.janusgraph.graphdb.management.utils.JanusGraphManagerException;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
 import java.util.function.Function;
 import java.util.Set;
 import java.util.Map;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import javax.script.SimpleBindings;
 import javax.script.Bindings;
 
@@ -40,12 +48,15 @@ import javax.script.Bindings;
  */
 public class JanusGraphManager implements GraphManager {
 
-    public static final String JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG = "Gremlin Server must be configured to use the JanusGraphManager.";
+    private static final Logger log =
+        LoggerFactory.getLogger(JanusGraphManager.class);
+    public static final String JANUS_GRAPH_MANAGER_EXPECTED_STATE_MSG
+            = "Gremlin Server must be configured to use the JanusGraphManager.";
 
-    private final Map<String, Graph> graphs = new ConcurrentHashMap<String, Graph>();
-    private final Map<String, TraversalSource> traversalSources = new ConcurrentHashMap<String, TraversalSource>();
-    private Settings settings = null;
+    private final Map<String, Graph> graphs = new ConcurrentHashMap<>();
+    private final Map<String, TraversalSource> traversalSources = new ConcurrentHashMap<>();
     private final Object instantiateGraphLock = new Object();
+    private GremlinExecutor gremlinExecutor = null;
 
     private static JanusGraphManager instance = null;
     private static final String CONFIGURATION_MANAGEMENT_GRAPH_KEY = ConfigurationManagementGraph.class.getSimpleName();
@@ -59,7 +70,6 @@ public class JanusGraphManager implements GraphManager {
      */
     public JanusGraphManager(Settings settings) {
         initialize();
-        this.settings = settings;
         // Open graphs defined at server start in settings.graphs
         settings.graphs.forEach((key, value) -> {
             final StandardJanusGraph graph = (StandardJanusGraph) JanusGraphFactory.open(value, key);
@@ -70,11 +80,11 @@ public class JanusGraphManager implements GraphManager {
     }
 
     private synchronized void initialize() {
-        if (null != this.instance) {
+        if (null != instance) {
             final String errMsg = "You may not instantiate a JanusGraphManager. The single instance should be handled by Tinkerpop's GremlinServer startup processes.";
             throw new JanusGraphManagerException(errMsg);
         }
-        this.instance = this;
+        instance = this;
     }
 
     public static JanusGraphManager getInstance() {
@@ -88,6 +98,42 @@ public class JanusGraphManager implements GraphManager {
         } else {
             return instance;
         }
+    }
+
+    public void configureGremlinExecutor(GremlinExecutor gremlinExecutor) {
+        this.gremlinExecutor = gremlinExecutor;
+        final ScheduledExecutorService bindExecutor = Executors.newScheduledThreadPool(1);
+        // Dynamically created graphs created with the ConfiguredGraphFactory are
+        // bound across all nodes in the cluster and in the face of server restarts
+        bindExecutor.scheduleWithFixedDelay(new GremlinExecutorGraphBinder(this.gremlinExecutor), 0, 20L, TimeUnit.SECONDS);
+    }
+
+    private class GremlinExecutorGraphBinder implements Runnable {
+        final GremlinExecutor gremlinExecutor;
+
+        public GremlinExecutorGraphBinder(GremlinExecutor gremlinExecutor) {
+            this.gremlinExecutor = gremlinExecutor;
+        }
+
+        @Override
+        public void run() {
+            ConfiguredGraphFactory.getGraphNames().forEach(it -> {
+                try {
+                    final Graph graph = ConfiguredGraphFactory.open(it);
+                    this.gremlinExecutor.getScriptEngineManager().put(it, graph);
+                    this.gremlinExecutor.getScriptEngineManager().put(it + "_traversal", graph.traversal());
+                } catch (Exception e) {
+                    // cannot open graph, do nothing
+                    log.error(String.format("Failed to open graph %s with the following error:\n %s.\n" +
+                    "Thus, it and its traversal will not be bound on this server.", it, e.toString()));
+                }
+            });
+        }
+    }
+
+    // To be used for testing purposes
+    protected static void shutdownJanusGraphManager() {
+        instance = null;
     }
 
     /**
@@ -118,6 +164,7 @@ public class JanusGraphManager implements GraphManager {
      * @Deprecated
      */
     @Override
+    @Deprecated
     public Map<String, TraversalSource> getTraversalSources() {
         return traversalSources;
     }
@@ -152,8 +199,7 @@ public class JanusGraphManager implements GraphManager {
 
     @Override
     public void rollbackAll() {
-        graphs.forEach((key, value) -> {
-            final Graph graph = value;
+        graphs.forEach((key, graph) -> {
             if (graph.tx().isOpen()) {
                 graph.tx().rollback();
             }
@@ -167,8 +213,7 @@ public class JanusGraphManager implements GraphManager {
 
     @Override
     public void commitAll() {
-        graphs.forEach((key, value) -> {
-            final Graph graph = value;
+        graphs.forEach((key, graph) -> {
             if (graph.tx().isOpen())
                 graph.tx().commit();
         });
@@ -202,6 +247,10 @@ public class JanusGraphManager implements GraphManager {
     public Graph openGraph(String gName, Function<String, Graph> thunk) {
         Graph graph = graphs.get(gName);
         if (graph != null && !((StandardJanusGraph) graph).isClosed()) {
+            if (null != gremlinExecutor) {
+                this.gremlinExecutor.getScriptEngineManager().put(gName, graph);
+                this.gremlinExecutor.getScriptEngineManager().put(gName + "_traversal", graph.traversal());
+            }
             return graph;
         } else {
             synchronized (instantiateGraphLock) {
@@ -210,6 +259,10 @@ public class JanusGraphManager implements GraphManager {
                     graph = thunk.apply(gName);
                     graphs.put(gName, graph);
                 }
+            }
+            if (null != gremlinExecutor) {
+                this.gremlinExecutor.getScriptEngineManager().put(gName, graph);
+                this.gremlinExecutor.getScriptEngineManager().put(gName + "_traversal", graph.traversal());
             }
             return graph;
         }
